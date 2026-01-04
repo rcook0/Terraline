@@ -1,0 +1,830 @@
+//@version=6
+indicator("Terraline-like Zones + Probabilistic Reaction Interpreter (v1.2, concurrent)", overlay=true, max_labels_count=500, max_boxes_count=200)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpZones = "Zone Engine"
+maxZones      = input.int(12,  "Max zones kept", minval=4, maxval=40, group=grpZones)
+pivotL        = input.int(5,   "Pivot Left", minval=2, maxval=20, group=grpZones)
+pivotR        = input.int(5,   "Pivot Right", minval=2, maxval=20, group=grpZones)
+atrLen        = input.int(14,  "ATR Length", minval=5, maxval=100, group=grpZones)
+zoneWidthK    = input.float(0.40, "Zone half-width (ATR * k)", step=0.05, minval=0.05, maxval=2.0, group=grpZones)
+mergeOverlap  = input.float(0.60, "Merge if overlap >= fraction", step=0.05, minval=0.10, maxval=0.95, group=grpZones)
+mergeCenterK  = input.float(0.30, "Merge if centers within ATR*k", step=0.05, minval=0.05, maxval=2.0, group=grpZones)
+keepSup       = input.int(2, "Active supports below price", minval=1, maxval=5, group=grpZones)
+keepRes       = input.int(2, "Active resistances above price", minval=1, maxval=5, group=grpZones)
+ttlBars       = input.int(400, "Zone TTL bars (0=off)", minval=0, maxval=5000, group=grpZones)
+
+grpVis = "Visibility / Validation"
+showZones           = input.bool(true, "Draw zones", group=grpVis)
+showOnlyValidated   = input.bool(false, "Show only validated zones", group=grpVis)
+selectOnlyValidated = input.bool(false, "Select only validated zones", group=grpVis)
+
+grpSess = "Session / Fatigue"
+useSessions   = input.bool(true, "Session-aware decay", group=grpSess)
+sessAsia      = input.session("0000-0800", "Asia session", group=grpSess)
+sessLondon    = input.session("0800-1600", "London session", group=grpSess)
+sessNY        = input.session("1600-2359", "NY session", group=grpSess)
+decayIntra    = input.float(0.995, "TouchPressure decay intra-session", step=0.001, minval=0.900, maxval=0.999, group=grpSess)
+decayInter    = input.float(0.85,  "TouchPressure decay at session change", step=0.01,  minval=0.10,  maxval=0.99,  group=grpSess)
+exitEpsK      = input.float(0.30,  "Exit eps (ATR*k) to reset touch", step=0.05, minval=0.05, maxval=2.0, group=grpSess)
+epsK          = input.float(0.10,  "Zone eps (ATR*k) for pierce/hold", step=0.01, minval=0.01, maxval=1.0, group=grpSess)
+
+grpReact = "Reaction Interpreter"
+lookApproach  = input.int(5, "Approach window (bars)", minval=3, maxval=20, group=grpReact)
+lookReact     = input.int(5, "Reaction window (bars)", minval=3, maxval=20, group=grpReact)
+dispK         = input.float(0.60, "Displacement threshold (ATR*k)", step=0.05, minval=0.10, maxval=3.0, group=grpReact)
+holdBars      = input.int(2, "Hold bars for Slice evidence", minval=1, maxval=5, group=grpReact)
+minConf       = input.float(0.60, "Min confidence for alerts", step=0.01, minval=0.05, maxval=0.95, group=grpReact)
+showLabels    = input.bool(true, "Show classification labels", group=grpReact)
+
+grpPanel = "On-chart Panel"
+showPanel     = input.bool(true, "Show panel", group=grpPanel)
+panelPos      = input.string("Top Right", "Panel position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=grpPanel)
+
+grpBB = "Bollinger Context"
+bbLen        = input.int(20, "BB length", minval=5, maxval=200, group=grpBB)
+bbMult       = input.float(2.0, "BB stdev", step=0.1, minval=0.5, maxval=4.0, group=grpBB)
+bbWalkCloses = input.int(2, "Band-walk closes", minval=2, maxval=5, group=grpBB)
+
+// ============================================================
+// Derived series
+// ============================================================
+atr  = ta.atr(atrLen)
+eps  = epsK * atr
+exitEps = exitEpsK * atr
+dispThr = dispK * atr
+
+mid = ta.sma(close, bbLen)
+dev = bbMult * ta.stdev(close, bbLen)
+upper = mid + dev
+lower = mid - dev
+bbWidthN = (upper - lower) / math.max(mid, syminfo.mintick)
+
+bbTouchLower = low <= lower
+bbTouchUpper = high >= upper
+bbWalkUp = close > upper and ta.barssince(close <= upper) > (bbWalkCloses - 1)
+bbWalkDn = close < lower and ta.barssince(close >= lower) > (bbWalkCloses - 1)
+
+// crude squeeze proxy (no percentile in Pine)
+bbWidthMin = ta.lowest(bbWidthN, 252)
+bbSqueeze  = bbWidthN <= bbWidthMin * 1.15
+
+// ============================================================
+// Session change detection
+// ============================================================
+inAsia   = not na(time(timeframe.period, sessAsia))
+inLondon = not na(time(timeframe.period, sessLondon))
+inNY     = not na(time(timeframe.period, sessNY))
+
+sessId = inAsia ? 1 : inLondon ? 2 : inNY ? 3 : 0
+var int prevSessId = sessId
+newSession = useSessions ? (sessId != prevSessId) : false
+prevSessId := sessId
+
+decayFactor = useSessions ? (newSession ? decayInter : decayIntra) : decayIntra
+
+// ============================================================
+// Helpers
+// ============================================================
+f_clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_overlapFrac(a1, a2, b1, b2) =>
+    lo = math.max(a1, b1)
+    hi = math.min(a2, b2)
+    inter = math.max(0.0, hi - lo)
+    uni = math.max(1e-9, (a2 - a1) + (b2 - b1) - inter)
+    inter / uni
+
+f_distToZone(zl, zh) =>
+    close < zl ? (zl - close) : close > zh ? (close - zh) : 0.0
+
+f_approachId(zl, zh) =>
+    dNow = f_distToZone(zl, zh)
+    dPrev = f_distToZone(zl, zh)[1]
+    approaching = (dNow > 0) and (dPrev > 0) and (dNow < dPrev)
+
+    vRatio = volume / math.max(ta.sma(volume, 20), 1)
+    rangeN = (high - low) / math.max(atr, syminfo.mintick)
+    bodyN  = math.abs(close - open) / math.max(atr, syminfo.mintick)
+    closePos = (close - low) / math.max(high - low, syminfo.mintick)
+
+    fastScore   = approaching ? f_clamp((ta.sma(rangeN, lookApproach) - 1.0) + (ta.sma(bodyN, lookApproach) - 0.5) + (ta.sma(vRatio, lookApproach) - 1.0), 0.0, 1.0) : 0.0
+    driftScore  = approaching ? f_clamp((0.9 - ta.sma(rangeN, lookApproach)) + (0.5 - ta.sma(bodyN, lookApproach)), 0.0, 1.0) : 0.0
+    flips = ta.sum(ta.change(math.sign(close - open)) != 0 ? 1 : 0, lookApproach)
+    stairScore  = approaching ? f_clamp(flips / 3.0, 0.0, 1.0) : 0.0
+    climaxScore = approaching ? f_clamp((rangeN > 1.8 ? 0.6 : 0.0) + (vRatio > 1.5 ? 0.4 : 0.0) + ((closePos > 0.75 or closePos < 0.25) ? 0.2 : 0.0), 0.0, 1.0) : 0.0
+
+    climaxScore > fastScore and climaxScore > driftScore and climaxScore > stairScore ? 3 :
+     fastScore > driftScore and fastScore > stairScore ? 0 :
+     driftScore > stairScore ? 1 : 2
+
+f_approachName(id) =>
+    id == 0 ? "FAST" : id == 1 ? "DRIFT" : id == 2 ? "STAIR" : "CLIMAX"
+
+f_priors(approachId) =>
+    // [Rj, Ac, Cp, Sl, Sw]
+    approachId == 0 ? array.from(0.12, 0.10, 0.18, 0.40, 0.20) :
+    approachId == 1 ? array.from(0.18, 0.34, 0.30, 0.10, 0.08) :
+    approachId == 2 ? array.from(0.16, 0.20, 0.36, 0.18, 0.10) :
+                      array.from(0.20, 0.08, 0.12, 0.22, 0.38)
+
+f_renorm(pRj, pAc, pCp, pSl, pSw) =>
+    s = pRj + pAc + pCp + pSl + pSw
+    s <= 0 ? array.from(0.2,0.2,0.2,0.2,0.2) : array.from(pRj/s, pAc/s, pCp/s, pSl/s, pSw/s)
+
+f_lifecycleName(x) =>
+    x == 0 ? "FRESH" : x == 1 ? "AGED" : x == 2 ? "EXHAUSTED" : "?"
+
+f_panelPos(pos) =>
+    pos == "Top Left" ? position.top_left :
+    pos == "Bottom Right" ? position.bottom_right :
+    pos == "Bottom Left" ? position.bottom_left :
+                           position.top_right
+
+f_pct(x) => str.tostring(100.0 * x, "#.0") + "%"
+
+// ============================================================
+// Zone store (arrays)
+// + Episode store per zone (parallel arrays)
+// ============================================================
+var zonesLow   = array.new_float()
+var zonesHigh  = array.new_float()
+var zonesBorn  = array.new_int()
+var zonesValid = array.new_bool()
+var zonesTP    = array.new_float()
+var zonesInInt = array.new_bool()
+var zonesBox   = array.new_box()
+
+// Episode arrays (parallel to zones)
+var epActiveArr   = array.new_bool()
+var epStepArr     = array.new_int()
+var epApproachIdA = array.new_int()
+var epLifeA       = array.new_int()
+var epTPsnapA     = array.new_float()
+var epFatA        = array.new_float()
+
+var sRjA = array.new_float()
+var sAcA = array.new_float()
+var sCpA = array.new_float()
+var sSlA = array.new_float()
+var sSwA = array.new_float()
+
+var pRj0A = array.new_float()
+var pAc0A = array.new_float()
+var pCp0A = array.new_float()
+var pSl0A = array.new_float()
+var pSw0A = array.new_float()
+
+var PRjA = array.new_float()
+var PAcA = array.new_float()
+var PCpA = array.new_float()
+var PSlA = array.new_float()
+var PSwA = array.new_float()
+
+var lastDomA  = array.new_string()
+var lastConfA = array.new_float()
+var lastEntA  = array.new_float()
+var lastDoneBarA = array.new_int()
+
+// Delete zone at idx (including all episode parallel arrays)
+f_delete_zone(idx) =>
+    bx = array.get(zonesBox, idx)
+    if not na(bx)
+        box.delete(bx)
+
+    array.remove(zonesLow, idx)
+    array.remove(zonesHigh, idx)
+    array.remove(zonesBorn, idx)
+    array.remove(zonesValid, idx)
+    array.remove(zonesTP, idx)
+    array.remove(zonesInInt, idx)
+    array.remove(zonesBox, idx)
+
+    array.remove(epActiveArr, idx)
+    array.remove(epStepArr, idx)
+    array.remove(epApproachIdA, idx)
+    array.remove(epLifeA, idx)
+    array.remove(epTPsnapA, idx)
+    array.remove(epFatA, idx)
+
+    array.remove(sRjA, idx)
+    array.remove(sAcA, idx)
+    array.remove(sCpA, idx)
+    array.remove(sSlA, idx)
+    array.remove(sSwA, idx)
+
+    array.remove(pRj0A, idx)
+    array.remove(pAc0A, idx)
+    array.remove(pCp0A, idx)
+    array.remove(pSl0A, idx)
+    array.remove(pSw0A, idx)
+
+    array.remove(PRjA, idx)
+    array.remove(PAcA, idx)
+    array.remove(PCpA, idx)
+    array.remove(PSlA, idx)
+    array.remove(PSwA, idx)
+
+    array.remove(lastDomA, idx)
+    array.remove(lastConfA, idx)
+    array.remove(lastEntA, idx)
+    array.remove(lastDoneBarA, idx)
+
+// Merge zone i into j (j keeps) then delete i
+f_merge_into(i, j) =>
+    li = array.get(zonesLow, i)
+    hi = array.get(zonesHigh, i)
+    lj = array.get(zonesLow, j)
+    hj = array.get(zonesHigh, j)
+
+    array.set(zonesLow, j, math.min(li, lj))
+    array.set(zonesHigh, j, math.max(hi, hj))
+    array.set(zonesTP, j, array.get(zonesTP, j) + array.get(zonesTP, i))
+    array.set(zonesValid, j, array.get(zonesValid, j) or array.get(zonesValid, i))
+
+    // If either had an active episode, keep the "more progressed" one
+    if array.get(epActiveArr, i) and not array.get(epActiveArr, j)
+        array.set(epActiveArr, j, true)
+        array.set(epStepArr, j, array.get(epStepArr, i))
+        array.set(epApproachIdA, j, array.get(epApproachIdA, i))
+        array.set(epLifeA, j, array.get(epLifeA, i))
+        array.set(epTPsnapA, j, array.get(epTPsnapA, i))
+        array.set(epFatA, j, array.get(epFatA, i))
+        array.set(sRjA, j, array.get(sRjA, i))
+        array.set(sAcA, j, array.get(sAcA, i))
+        array.set(sCpA, j, array.get(sCpA, i))
+        array.set(sSlA, j, array.get(sSlA, i))
+        array.set(sSwA, j, array.get(sSwA, i))
+        array.set(pRj0A, j, array.get(pRj0A, i))
+        array.set(pAc0A, j, array.get(pAc0A, i))
+        array.set(pCp0A, j, array.get(pCp0A, i))
+        array.set(pSl0A, j, array.get(pSl0A, i))
+        array.set(pSw0A, j, array.get(pSw0A, i))
+        array.set(PRjA, j, array.get(PRjA, i))
+        array.set(PAcA, j, array.get(PAcA, i))
+        array.set(PCpA, j, array.get(PCpA, i))
+        array.set(PSlA, j, array.get(PSlA, i))
+        array.set(PSwA, j, array.get(PSwA, i))
+
+    f_delete_zone(i)
+
+// Create zone and initialize parallel episode arrays
+f_add_zone(center) =>
+    w = math.max(zoneWidthK * atr, syminfo.mintick * 10)
+    zl = center - w
+    zh = center + w
+
+    array.push(zonesLow, zl)
+    array.push(zonesHigh, zh)
+    array.push(zonesBorn, bar_index)
+    array.push(zonesValid, false)
+    array.push(zonesTP, 0.0)
+    array.push(zonesInInt, false)
+    array.push(zonesBox, na)
+
+    array.push(epActiveArr, false)
+    array.push(epStepArr, 0)
+    array.push(epApproachIdA, na)
+    array.push(epLifeA, na)
+    array.push(epTPsnapA, na)
+    array.push(epFatA, na)
+
+    array.push(sRjA, 0.0)
+    array.push(sAcA, 0.0)
+    array.push(sCpA, 0.0)
+    array.push(sSlA, 0.0)
+    array.push(sSwA, 0.0)
+
+    array.push(pRj0A, 0.2)
+    array.push(pAc0A, 0.2)
+    array.push(pCp0A, 0.2)
+    array.push(pSl0A, 0.2)
+    array.push(pSw0A, 0.2)
+
+    array.push(PRjA, na)
+    array.push(PAcA, na)
+    array.push(PCpA, na)
+    array.push(PSlA, na)
+    array.push(PSwA, na)
+
+    array.push(lastDomA, "")
+    array.push(lastConfA, na)
+    array.push(lastEntA, na)
+    array.push(lastDoneBarA, na)
+
+// ============================================================
+// Zone creation via pivots
+// ============================================================
+ph = ta.pivothigh(high, pivotL, pivotR)
+pl = ta.pivotlow(low, pivotL, pivotR)
+if not na(ph)
+    f_add_zone(ph)
+if not na(pl)
+    f_add_zone(pl)
+
+// ============================================================
+// Merge pass (n small)
+// ============================================================
+n = array.size(zonesLow)
+if n > 1
+    for pass = 0 to 1
+        i = 0
+        while i < array.size(zonesLow)
+            j = i + 1
+            while j < array.size(zonesLow)
+                li = array.get(zonesLow, i)
+                hi = array.get(zonesHigh, i)
+                lj = array.get(zonesLow, j)
+                hj = array.get(zonesHigh, j)
+                oi = f_overlapFrac(li, hi, lj, hj)
+                ci = (li + hi) * 0.5
+                cj = (lj + hj) * 0.5
+                centersClose = math.abs(ci - cj) <= (mergeCenterK * atr)
+                if oi >= mergeOverlap or centersClose
+                    f_merge_into(j, i)
+                else
+                    j += 1
+            i += 1
+
+// ============================================================
+// Cap zone count (drop oldest first)
+// ============================================================
+while array.size(zonesLow) > maxZones
+    oldestIdx = 0
+    oldestBorn = array.get(zonesBorn, 0)
+    for i = 1 to array.size(zonesBorn) - 1
+        b = array.get(zonesBorn, i)
+        if b < oldestBorn
+            oldestBorn := b
+            oldestIdx := i
+    f_delete_zone(oldestIdx)
+
+// ============================================================
+// TTL retirement
+// ============================================================
+if ttlBars > 0
+    i = 0
+    while i < array.size(zonesLow)
+        born = array.get(zonesBorn, i)
+        if bar_index - born > ttlBars
+            f_delete_zone(i)
+        else
+            i += 1
+
+// ============================================================
+// Update touchPressure decay + conditional drawing
+// ============================================================
+for i = 0 to array.size(zonesLow) - 1
+    zl = array.get(zonesLow, i)
+    zh = array.get(zonesHigh, i)
+    valid = array.get(zonesValid, i)
+
+    tp = array.get(zonesTP, i) * decayFactor
+    array.set(zonesTP, i, tp)
+
+    fatigue = f_clamp(tp / 6.0, 0.0, 1.0)
+    zoneState = fatigue < 0.30 ? 0 : fatigue < 0.65 ? 1 : 2
+    col = zoneState == 0 ? color.new(color.green, 85) :
+          zoneState == 1 ? color.new(color.orange, 85) :
+                           color.new(color.red, 85)
+
+    shouldShow = showZones and (not showOnlyValidated or valid)
+    bx = array.get(zonesBox, i)
+
+    if shouldShow and na(bx)
+        bx := box.new(left=bar_index, top=zh, right=bar_index+1, bottom=zl, border_width=1)
+        box.set_extend(bx, extend.right)
+        array.set(zonesBox, i, bx)
+
+    if shouldShow and not na(bx)
+        box.set_top(bx, zh)
+        box.set_bottom(bx, zl)
+        box.set_bgcolor(bx, col)
+        box.set_border_color(bx, color.new(color.gray, 60))
+
+    if not shouldShow and not na(bx)
+        box.delete(bx)
+        array.set(zonesBox, i, na)
+
+// ============================================================
+// Active zone selection: nearest supports/resistances around price
+// ============================================================
+var activeIdx = array.new_int()
+array.clear(activeIdx)
+
+last = array.size(zonesLow)
+if last > 0
+    // Supports
+    for pick = 0 to keepSup - 1
+        bestI = na
+        bestD = 1e12
+        for i = 0 to last - 1
+            if selectOnlyValidated and not array.get(zonesValid, i)
+                continue
+            zl = array.get(zonesLow, i)
+            zh = array.get(zonesHigh, i)
+
+            already = false
+            for k = 0 to array.size(activeIdx) - 1
+                if array.get(activeIdx, k) == i
+                    already := true
+            if already
+                continue
+
+            isSup = (zh <= close) or (close >= zl and close <= zh)
+            if isSup
+                d = (close >= zl and close <= zh) ? 0.0 : (close - zh)
+                if d < bestD
+                    bestD := d
+                    bestI := i
+        if not na(bestI)
+            array.push(activeIdx, bestI)
+
+    // Resistances
+    for pick = 0 to keepRes - 1
+        bestI = na
+        bestD = 1e12
+        for i = 0 to last - 1
+            if selectOnlyValidated and not array.get(zonesValid, i)
+                continue
+            zl = array.get(zonesLow, i)
+            zh = array.get(zonesHigh, i)
+
+            already = false
+            for k = 0 to array.size(activeIdx) - 1
+                if array.get(activeIdx, k) == i
+                    already := true
+            if already
+                continue
+
+            isRes = (zl >= close) or (close >= zl and close <= zh)
+            if isRes
+                d = (close >= zl and close <= zh) ? 0.0 : (zl - close)
+                if d < bestD
+                    bestD := d
+                    bestI := i
+        if not na(bestI)
+            array.push(activeIdx, bestI)
+
+// ============================================================
+// Touch tracking per selected zone (debounced by exit)
+// ============================================================
+for k = 0 to array.size(activeIdx) - 1
+    i = array.get(activeIdx, k)
+    zl = array.get(zonesLow, i)
+    zh = array.get(zonesHigh, i)
+
+    touchZone = (high >= zl and low <= zh)
+    inInteraction = array.get(zonesInInt, i)
+    exited = (close > zh + exitEps) or (close < zl - exitEps)
+
+    newTouch = (not inInteraction) and touchZone
+    if newTouch
+        inZoneClose = (close >= zl and close <= zh)
+        sliceAttempt = (close > zh + eps) or (close < zl - eps)
+        touchW = inZoneClose ? 1.0 : 0.7
+        touchW += sliceAttempt ? 0.6 : 0.0
+
+        array.set(zonesTP, i, array.get(zonesTP, i) + touchW)
+        array.set(zonesInInt, i, true)
+
+    if inInteraction and exited
+        array.set(zonesInInt, i, false)
+
+// ============================================================
+// Episode concurrency:
+// - For every selected zone, start episode on touch if not active
+// - Update active episodes bar-by-bar
+// - Complete independently, label, validate, alert
+// ============================================================
+var int lastCompletedIdx = na
+var string lastCompletedDom = ""
+var float lastCompletedConf = na
+
+anyReject = false
+anyAccept = false
+anyCompress = false
+anySlice = false
+anySweep = false
+
+for k = 0 to array.size(activeIdx) - 1
+    i = array.get(activeIdx, k)
+    zl = array.get(zonesLow, i)
+    zh = array.get(zonesHigh, i)
+    valid = array.get(zonesValid, i)
+
+    touch = (high >= zl and low <= zh)
+    epActive = array.get(epActiveArr, i)
+
+    // START
+    if touch and not epActive
+        array.set(epActiveArr, i, true)
+        array.set(epStepArr, i, 0)
+        array.set(sRjA, i, 0.0)
+        array.set(sAcA, i, 0.0)
+        array.set(sCpA, i, 0.0)
+        array.set(sSlA, i, 0.0)
+        array.set(sSwA, i, 0.0)
+        array.set(PRjA, i, na)
+        array.set(PAcA, i, na)
+        array.set(PCpA, i, na)
+        array.set(PSlA, i, na)
+        array.set(PSwA, i, na)
+
+        // Approach priors
+        aId = f_approachId(zl, zh)
+        array.set(epApproachIdA, i, aId)
+
+        pr = f_priors(aId)
+        pRj = array.get(pr,0)
+        pAc = array.get(pr,1)
+        pCp = array.get(pr,2)
+        pSl = array.get(pr,3)
+        pSw = array.get(pr,4)
+
+        // Bollinger nudges
+        if (bbTouchLower or bbTouchUpper)
+            pRj += 0.08
+            pSw += 0.06
+            pAc -= 0.06
+        if (bbWalkUp or bbWalkDn)
+            pSl += 0.10
+            pRj -= 0.08
+        if bbSqueeze
+            pCp += 0.10
+            pSw -= 0.05
+
+        // Lifecycle nudges from current TP
+        tp = array.get(zonesTP, i)
+        fatigue = f_clamp(tp / 6.0, 0.0, 1.0)
+        life = fatigue < 0.30 ? 0 : fatigue < 0.65 ? 1 : 2
+        array.set(epLifeA, i, life)
+        array.set(epTPsnapA, i, tp)
+        array.set(epFatA, i, fatigue)
+
+        if life == 0
+            pRj += 0.10
+            pSw += 0.06
+            pSl -= 0.10
+        if life == 1
+            pCp += 0.08
+            pSl += 0.10
+            pRj -= 0.08
+        if life == 2
+            pSl += 0.18
+            pCp += 0.08
+            pRj -= 0.18
+            pSw -= 0.06
+
+        pr2 = f_renorm(pRj, pAc, pCp, pSl, pSw)
+        array.set(pRj0A, i, array.get(pr2,0))
+        array.set(pAc0A, i, array.get(pr2,1))
+        array.set(pCp0A, i, array.get(pr2,2))
+        array.set(pSl0A, i, array.get(pr2,3))
+        array.set(pSw0A, i, array.get(pr2,4))
+
+    // UPDATE
+    if array.get(epActiveArr, i)
+        step = array.get(epStepArr, i) + 1
+        array.set(epStepArr, i, step)
+
+        inZone = (close >= zl and close <= zh)
+        pierceUp  = high > zh + eps
+        pierceDn  = low  < zl - eps
+        closeAbove = close > zh + eps
+        closeBelow = close < zl - eps
+
+        wickUpN = (high - math.max(open, close)) / math.max(atr, syminfo.mintick)
+        wickDnN = (math.min(open, close) - low) / math.max(atr, syminfo.mintick)
+        dispAwayN = math.max(math.abs(close - zh), math.abs(close - zl)) / math.max(atr, syminfo.mintick)
+        rangeN = (high - low) / math.max(atr, syminfo.mintick)
+
+        // read scores
+        sRj = array.get(sRjA, i)
+        sAc = array.get(sAcA, i)
+        sCp = array.get(sCpA, i)
+        sSl = array.get(sSlA, i)
+        sSw = array.get(sSwA, i)
+
+        // Evidence deltas
+        if (pierceUp and close <= zh) or (pierceDn and close >= zl)
+            sSw += 0.8
+        sSw += 0.4 * math.max(wickUpN, wickDnN)
+
+        if closeAbove or closeBelow
+            sSl += 0.6
+        if holdBars >= 2
+            if (closeAbove and closeAbove[1]) or (closeBelow and closeBelow[1])
+                sSl += 0.4
+        sSl += 0.3 * dispAwayN
+
+        if inZone
+            sAc += 0.35
+
+        if not inZone and (dispAwayN * atr) > dispThr
+            sRj += 0.45
+        sRj += 0.15 * ((pierceUp ? wickUpN : 0.0) + (pierceDn ? wickDnN : 0.0))
+
+        if inZone and (rangeN < rangeN[1])
+            sCp += 0.35
+
+        // write back scores
+        array.set(sRjA, i, sRj)
+        array.set(sAcA, i, sAc)
+        array.set(sCpA, i, sCp)
+        array.set(sSlA, i, sSl)
+        array.set(sSwA, i, sSw)
+
+        // posterior via logits
+        pRj0 = array.get(pRj0A, i)
+        pAc0 = array.get(pAc0A, i)
+        pCp0 = array.get(pCp0A, i)
+        pSl0 = array.get(pSl0A, i)
+        pSw0 = array.get(pSw0A, i)
+
+        lRj = math.log(math.max(pRj0, 1e-9)) + sRj
+        lAc = math.log(math.max(pAc0, 1e-9)) + sAc
+        lCp = math.log(math.max(pCp0, 1e-9)) + sCp
+        lSl = math.log(math.max(pSl0, 1e-9)) + sSl
+        lSw = math.log(math.max(pSw0, 1e-9)) + sSw
+
+        eRj = math.exp(lRj)
+        eAc = math.exp(lAc)
+        eCp = math.exp(lCp)
+        eSl = math.exp(lSl)
+        eSw = math.exp(lSw)
+        denom = eRj + eAc + eCp + eSl + eSw
+
+        PRj = eRj / denom
+        PAc = eAc / denom
+        PCp = eCp / denom
+        PSl = eSl / denom
+        PSw = eSw / denom
+
+        array.set(PRjA, i, PRj)
+        array.set(PAcA, i, PAc)
+        array.set(PCpA, i, PCp)
+        array.set(PSlA, i, PSl)
+        array.set(PSwA, i, PSw)
+
+        // entropy
+        ent = 0.0
+        ent += PRj > 0 ? -PRj * math.log(PRj) : 0
+        ent += PAc > 0 ? -PAc * math.log(PAc) : 0
+        ent += PCp > 0 ? -PCp * math.log(PCp) : 0
+        ent += PSl > 0 ? -PSl * math.log(PSl) : 0
+        ent += PSw > 0 ? -PSw * math.log(PSw) : 0
+        array.set(lastEntA, i, ent)
+
+        // COMPLETE
+        if step >= lookReact
+            topP = math.max(PRj, math.max(PAc, math.max(PCp, math.max(PSl, PSw))))
+            dom = topP == PRj ? "REJECT" :
+                  topP == PAc ? "ACCEPT" :
+                  topP == PCp ? "COMPRESS" :
+                  topP == PSl ? "SLICE" : "SWEEP"
+
+            array.set(lastDomA, i, dom)
+            array.set(lastConfA, i, topP)
+            array.set(lastDoneBarA, i, bar_index)
+
+            lastCompletedIdx := i
+            lastCompletedDom := dom
+            lastCompletedConf := topP
+
+            if showLabels
+                label.new(bar_index, high, dom + "  " + str.tostring(topP*100, "#.0") + "%", style=label.style_label_down, textcolor=color.white, color=color.new(color.black, 60))
+
+            // validation
+            if (dom == "REJECT" or dom == "SWEEP") and topP >= 0.55
+                array.set(zonesValid, i, true)
+
+            // alerts (thresholded)
+            if topP >= minConf
+                anyReject   := anyReject   or (dom == "REJECT")
+                anyAccept   := anyAccept   or (dom == "ACCEPT")
+                anyCompress := anyCompress or (dom == "COMPRESS")
+                anySlice    := anySlice    or (dom == "SLICE")
+                anySweep    := anySweep    or (dom == "SWEEP")
+
+            // stop episode
+            array.set(epActiveArr, i, false)
+            array.set(epStepArr, i, 0)
+
+// ============================================================
+// Alerts (any zone)
+// ============================================================
+alertcondition(anyReject,   "Reaction: REJECT (any zone)",   "REJECT with confidence >= threshold")
+alertcondition(anyAccept,   "Reaction: ACCEPT (any zone)",   "ACCEPT with confidence >= threshold")
+alertcondition(anyCompress, "Reaction: COMPRESS (any zone)", "COMPRESS with confidence >= threshold")
+alertcondition(anySlice,    "Reaction: SLICE (any zone)",    "SLICE with confidence >= threshold")
+alertcondition(anySweep,    "Reaction: SWEEP (any zone)",    "SWEEP with confidence >= threshold")
+
+// ============================================================
+// Panel: show the most confident live episode, else last completed
+// ============================================================
+var table t = na
+if showPanel and na(t)
+    t := table.new(f_panelPos(panelPos), 2, 12, border_width=1)
+if not showPanel and not na(t)
+    table.delete(t)
+    t := na
+
+// Pick focus zone:
+// 1) among active episodes in activeIdx, max top posterior
+// 2) else lastCompletedIdx if set
+focusIdx = na
+focusLive = false
+bestP = -1.0
+
+for k = 0 to array.size(activeIdx) - 1
+    i = array.get(activeIdx, k)
+    if array.get(epActiveArr, i)
+        PRj = array.get(PRjA, i)
+        PAc = array.get(PAcA, i)
+        PCp = array.get(PCpA, i)
+        PSl = array.get(PSlA, i)
+        PSw = array.get(PSwA, i)
+        topP = math.max(PRj, math.max(PAc, math.max(PCp, math.max(PSl, PSw))))
+        if topP > bestP
+            bestP := topP
+            focusIdx := i
+            focusLive := true
+
+if na(focusIdx) and not na(lastCompletedIdx)
+    focusIdx := lastCompletedIdx
+    focusLive := false
+
+if showPanel and not na(t)
+    table.cell(t, 0, 0, "Interpreter", text_color=color.white, bgcolor=color.new(color.black, 30))
+    table.cell(t, 1, 0, syminfo.ticker, text_color=color.white, bgcolor=color.new(color.black, 30))
+
+    table.cell(t, 0, 1, "Focus", bgcolor=color.new(color.black, 85))
+    table.cell(t, 1, 1, na(focusIdx) ? "-" : (focusLive ? "LIVE" : "LAST"), bgcolor=color.new(color.black, 85))
+
+    if na(focusIdx)
+        // blank the rest
+        for r = 2 to 11
+            table.cell(t, 0, r, "", bgcolor=color.new(color.black, 92))
+            table.cell(t, 1, r, "", bgcolor=color.new(color.black, 92))
+    else
+        zl = array.get(zonesLow, focusIdx)
+        zh = array.get(zonesHigh, focusIdx)
+        valid = array.get(zonesValid, focusIdx)
+        tpSnap = array.get(epTPsnapA, focusIdx)
+        fatSnap = array.get(epFatA, focusIdx)
+        life = array.get(epLifeA, focusIdx)
+        aId = array.get(epApproachIdA, focusIdx)
+
+        table.cell(t, 0, 2, "Validated", bgcolor=color.new(color.black, 85))
+        table.cell(t, 1, 2, valid ? "YES" : "NO", bgcolor=color.new(color.black, 85))
+
+        table.cell(t, 0, 3, "Approach", bgcolor=color.new(color.black, 85))
+        table.cell(t, 1, 3, not na(aId) ? f_approachName(aId) : "-", bgcolor=color.new(color.black, 85))
+
+        table.cell(t, 0, 4, "Lifecycle", bgcolor=color.new(color.black, 85))
+        table.cell(t, 1, 4, not na(life) ? f_lifecycleName(life) : "-", bgcolor=color.new(color.black, 85))
+
+        table.cell(t, 0, 5, "TP / Fatigue", bgcolor=color.new(color.black, 85))
+        tpNow = array.get(zonesTP, focusIdx)
+        table.cell(t, 1, 5, str.tostring(tpNow, "#.00") + " / " + f_pct(f_clamp(tpNow/6.0,0,1)), bgcolor=color.new(color.black, 85))
+
+        // Priors
+        table.cell(t, 0, 6, "Priors", text_color=color.white, bgcolor=color.new(color.black, 55))
+        table.cell(t, 1, 6, "Rj/Ac/Cp/Sl/Sw", text_color=color.white, bgcolor=color.new(color.black, 55))
+
+        prTxt = f_pct(array.get(pRj0A, focusIdx)) + " / " + f_pct(array.get(pAc0A, focusIdx)) + " / " + f_pct(array.get(pCp0A, focusIdx)) + " / " + f_pct(array.get(pSl0A, focusIdx)) + " / " + f_pct(array.get(pSw0A, focusIdx))
+        table.cell(t, 0, 7, "Prior", bgcolor=color.new(color.black, 85))
+        table.cell(t, 1, 7, prTxt, bgcolor=color.new(color.black, 85))
+
+        // Posteriors if live
+        postTxt = "-"
+        if focusLive
+            PRj = array.get(PRjA, focusIdx)
+            PAc = array.get(PAcA, focusIdx)
+            PCp = array.get(PCpA, focusIdx)
+            PSl = array.get(PSlA, focusIdx)
+            PSw = array.get(PSwA, focusIdx)
+            postTxt := f_pct(PRj) + " / " + f_pct(PAc) + " / " + f_pct(PCp) + " / " + f_pct(PSl) + " / " + f_pct(PSw)
+
+        table.cell(t, 0, 8, "Posterior", bgcolor=color.new(color.black, 85))
+        table.cell(t, 1, 8, postTxt, bgcolor=color.new(color.black, 85))
+
+        // Dominant
+        dom = array.get(lastDomA, focusIdx)
+        conf = array.get(lastConfA, focusIdx)
+        table.cell(t, 0, 9, "Dominant", bgcolor=color.new(color.black, 85))
+        table.cell(t, 1, 9, (dom != "" ? dom : "-") + (not na(conf) ? ("  " + f_pct(conf)) : ""), bgcolor=color.new(color.black, 85))
+
+        // Uncertainty
+        ent = array.get(lastEntA, focusIdx)
+        table.cell(t, 0, 10, "Entropy", bgcolor=color.new(color.black, 85))
+        table.cell(t, 1, 10, not na(ent) ? str.tostring(ent, "#.000") : "-", bgcolor=color.new(color.black, 85))
+
+        // Context flags
+        ctx = (bbSqueeze ? "SQUEEZE " : "") + ((bbWalkUp or bbWalkDn) ? "WALK " : "") + ((bbTouchUpper or bbTouchLower) ? "TOUCH" : "")
+        table.cell(t, 0, 11, "BB ctx", bgcolor=color.new(color.black, 85))
+        table.cell(t, 1, 11, ctx == "" ? "-" : ctx, bgcolor=color.new(color.black, 85))
