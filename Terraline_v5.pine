@@ -1,0 +1,860 @@
+//@version=6
+indicator("Terraline-like Zones + Probabilistic Reaction Interpreter (v1.4, role-switch)", overlay=true, max_labels_count=500, max_boxes_count=250)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpZones = "Zone Engine"
+maxZones      = input.int(12,  "Max zones kept", minval=4, maxval=60, group=grpZones)
+pivotL        = input.int(5,   "Pivot Left", minval=2, maxval=20, group=grpZones)
+pivotR        = input.int(5,   "Pivot Right", minval=2, maxval=20, group=grpZones)
+atrLen        = input.int(14,  "ATR Length", minval=5, maxval=100, group=grpZones)
+zoneWidthK    = input.float(0.40, "Zone half-width (ATR * k)", step=0.05, minval=0.05, maxval=2.0, group=grpZones)
+mergeOverlap  = input.float(0.60, "Merge if overlap >= fraction", step=0.05, minval=0.10, maxval=0.95, group=grpZones)
+mergeCenterK  = input.float(0.30, "Merge if centers within ATR*k", step=0.05, minval=0.05, maxval=2.0, group=grpZones)
+keepSup       = input.int(2, "Active supports below price", minval=1, maxval=8, group=grpZones)
+keepRes       = input.int(2, "Active resistances above price", minval=1, maxval=8, group=grpZones)
+ttlBars       = input.int(400, "Zone TTL bars (0=off)", minval=0, maxval=5000, group=grpZones)
+
+grpVis = "Visibility / Validation"
+showZones           = input.bool(true, "Draw zones", group=grpVis)
+showOnlyValidated   = input.bool(false, "Show only validated zones", group=grpVis)
+selectOnlyValidated = input.bool(false, "Select only validated zones", group=grpVis)
+
+grpSess = "Session / Fatigue"
+useSessions   = input.bool(true, "Session-aware decay", group=grpSess)
+sessAsia      = input.session("0000-0800", "Asia session", group=grpSess)
+sessLondon    = input.session("0800-1600", "London session", group=grpSess)
+sessNY        = input.session("1600-2359", "NY session", group=grpSess)
+decayIntra    = input.float(0.995, "TouchPressure decay intra-session", step=0.001, minval=0.900, maxval=0.999, group=grpSess)
+decayInter    = input.float(0.85,  "TouchPressure decay at session change", step=0.01,  minval=0.10,  maxval=0.99,  group=grpSess)
+exitEpsK      = input.float(0.30,  "Exit eps (ATR*k) to reset touch", step=0.05, minval=0.05, maxval=2.0, group=grpSess)
+epsK          = input.float(0.10,  "Zone eps (ATR*k) for pierce/hold", step=0.01, minval=0.01, maxval=1.0, group=grpSess)
+
+grpReact = "Reaction Interpreter"
+lookApproach  = input.int(5, "Approach window (bars)", minval=3, maxval=20, group=grpReact)
+lookReact     = input.int(5, "Reaction window (bars)", minval=3, maxval=20, group=grpReact)
+dispK         = input.float(0.60, "Displacement threshold (ATR*k)", step=0.05, minval=0.10, maxval=3.0, group=grpReact)
+holdBars      = input.int(2, "Hold bars for Slice evidence", minval=1, maxval=5, group=grpReact)
+minConf       = input.float(0.60, "Min confidence for alerts", step=0.01, minval=0.05, maxval=0.95, group=grpReact)
+showLabels    = input.bool(true, "Show classification labels", group=grpReact)
+
+grpCooldown = "Episode Cooldown"
+useCooldown  = input.bool(true, "Enable per-zone cooldown", group=grpCooldown)
+cooldownBars = input.int(8, "Cooldown bars after episode", minval=0, maxval=200, group=grpCooldown)
+
+grpRetire = "Zone Retirement"
+autoRetire      = input.bool(true, "Auto-retire on strong SLICE hold", group=grpRetire)
+retireConf      = input.float(0.65, "Retire if P(SLICE) >= ", step=0.01, minval=0.50, maxval=0.95, group=grpRetire)
+retireHoldBars  = input.int(2, "Retire requires hold bars", minval=1, maxval=5, group=grpRetire)
+retireMark      = input.bool(true, "Visually mark retired zones", group=grpRetire)
+
+grpRole = "Post-break Role Switch"
+enableRoleSwitch     = input.bool(true, "Enable role-switch zone creation", group=grpRole)
+roleSwitchWidthMult  = input.float(0.80, "Role-switch width multiplier", step=0.05, minval=0.30, maxval=2.0, group=grpRole)
+roleSwitchValidate    = input.bool(false, "Role-switch zones start validated", group=grpRole)
+roleSwitchFirstTouchBoost = input.bool(true, "Boost priors on first retest", group=grpRole)
+boostAc     = input.float(0.12, "Boost ACCEPT", step=0.01, minval=0.0, maxval=0.4, group=grpRole)
+boostCp     = input.float(0.08, "Boost COMPRESS", step=0.01, minval=0.0, maxval=0.4, group=grpRole)
+penalizeSl  = input.float(0.10, "Penalize SLICE", step=0.01, minval=0.0, maxval=0.4, group=grpRole)
+bypassCooldownOnRetest = input.bool(true, "Bypass cooldown on first retest", group=grpRole)
+
+grpPanel = "On-chart Panel"
+showPanel     = input.bool(true, "Show panel", group=grpPanel)
+panelPos      = input.string("Top Right", "Panel position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=grpPanel)
+panelMode     = input.string("Top 3", "Panel mode", options=["Top 1","Top 3"], group=grpPanel)
+
+grpBB = "Bollinger Context"
+bbLen        = input.int(20, "BB length", minval=5, maxval=200, group=grpBB)
+bbMult       = input.float(2.0, "BB stdev", step=0.1, minval=0.5, maxval=4.0, group=grpBB)
+bbWalkCloses = input.int(2, "Band-walk closes", minval=2, maxval=5, group=grpBB)
+
+// ============================================================
+// Derived series
+// ============================================================
+atr  = ta.atr(atrLen)
+eps  = epsK * atr
+exitEps = exitEpsK * atr
+dispThr = dispK * atr
+
+mid = ta.sma(close, bbLen)
+dev = bbMult * ta.stdev(close, bbLen)
+upper = mid + dev
+lower = mid - dev
+bbWidthN = (upper - lower) / math.max(mid, syminfo.mintick)
+
+bbTouchLower = low <= lower
+bbTouchUpper = high >= upper
+bbWalkUp = close > upper and ta.barssince(close <= upper) > (bbWalkCloses - 1)
+bbWalkDn = close < lower and ta.barssince(close >= lower) > (bbWalkCloses - 1)
+
+bbWidthMin = ta.lowest(bbWidthN, 252)
+bbSqueeze  = bbWidthN <= bbWidthMin * 1.15
+
+// Session change detection
+inAsia   = not na(time(timeframe.period, sessAsia))
+inLondon = not na(time(timeframe.period, sessLondon))
+inNY     = not na(time(timeframe.period, sessNY))
+sessId = inAsia ? 1 : inLondon ? 2 : inNY ? 3 : 0
+var int prevSessId = sessId
+newSession = useSessions ? (sessId != prevSessId) : false
+prevSessId := sessId
+decayFactor = useSessions ? (newSession ? decayInter : decayIntra) : decayIntra
+
+// ============================================================
+// Helpers
+// ============================================================
+f_clamp(x, lo, hi) => math.max(lo, math.min(hi, x))
+f_pct(x) => str.tostring(100.0 * x, "#.0") + "%"
+
+f_overlapFrac(a1, a2, b1, b2) =>
+    lo = math.max(a1, b1)
+    hi = math.min(a2, b2)
+    inter = math.max(0.0, hi - lo)
+    uni = math.max(1e-9, (a2 - a1) + (b2 - b1) - inter)
+    inter / uni
+
+f_distToZone(zl, zh) =>
+    close < zl ? (zl - close) : close > zh ? (close - zh) : 0.0
+
+f_approachId(zl, zh) =>
+    dNow = f_distToZone(zl, zh)
+    dPrev = f_distToZone(zl, zh)[1]
+    approaching = (dNow > 0) and (dPrev > 0) and (dNow < dPrev)
+
+    vRatio = volume / math.max(ta.sma(volume, 20), 1)
+    rangeN = (high - low) / math.max(atr, syminfo.mintick)
+    bodyN  = math.abs(close - open) / math.max(atr, syminfo.mintick)
+    closePos = (close - low) / math.max(high - low, syminfo.mintick)
+
+    fastScore   = approaching ? f_clamp((ta.sma(rangeN, lookApproach) - 1.0) + (ta.sma(bodyN, lookApproach) - 0.5) + (ta.sma(vRatio, lookApproach) - 1.0), 0.0, 1.0) : 0.0
+    driftScore  = approaching ? f_clamp((0.9 - ta.sma(rangeN, lookApproach)) + (0.5 - ta.sma(bodyN, lookApproach)), 0.0, 1.0) : 0.0
+    flips = ta.sum(ta.change(math.sign(close - open)) != 0 ? 1 : 0, lookApproach)
+    stairScore  = approaching ? f_clamp(flips / 3.0, 0.0, 1.0) : 0.0
+    climaxScore = approaching ? f_clamp((rangeN > 1.8 ? 0.6 : 0.0) + (vRatio > 1.5 ? 0.4 : 0.0) + ((closePos > 0.75 or closePos < 0.25) ? 0.2 : 0.0), 0.0, 1.0) : 0.0
+
+    climaxScore > fastScore and climaxScore > driftScore and climaxScore > stairScore ? 3 :
+     fastScore > driftScore and fastScore > stairScore ? 0 :
+     driftScore > stairScore ? 1 : 2
+
+f_approachName(id) => id == 0 ? "FAST" : id == 1 ? "DRIFT" : id == 2 ? "STAIR" : "CLIMAX"
+f_lifecycleName(x) => x == 0 ? "FRESH" : x == 1 ? "AGED" : x == 2 ? "EXHAUSTED" : "?"
+
+f_priors(approachId) =>
+    // [Rj, Ac, Cp, Sl, Sw]
+    approachId == 0 ? array.from(0.12, 0.10, 0.18, 0.40, 0.20) :
+    approachId == 1 ? array.from(0.18, 0.34, 0.30, 0.10, 0.08) :
+    approachId == 2 ? array.from(0.16, 0.20, 0.36, 0.18, 0.10) :
+                      array.from(0.20, 0.08, 0.12, 0.22, 0.38)
+
+f_renorm(pRj, pAc, pCp, pSl, pSw) =>
+    s = pRj + pAc + pCp + pSl + pSw
+    s <= 0 ? array.from(0.2,0.2,0.2,0.2,0.2) : array.from(pRj/s, pAc/s, pCp/s, pSl/s, pSw/s)
+
+f_panelPos(pos) =>
+    pos == "Top Left" ? position.top_left :
+    pos == "Bottom Right" ? position.bottom_right :
+    pos == "Bottom Left" ? position.bottom_left :
+                           position.top_right
+
+// ============================================================
+// Zone store + Episode store (parallel arrays)
+// ============================================================
+var zonesLow   = array.new_float()
+var zonesHigh  = array.new_float()
+var zonesBorn  = array.new_int()
+var zonesValid = array.new_bool()
+var zonesTP    = array.new_float()
+var zonesInInt = array.new_bool()
+var zonesBox   = array.new_box()
+
+// new: role-switch metadata
+var zoneRetired       = array.new_bool()
+var zoneRoleSwitched  = array.new_bool()  // created by role-switch
+var zoneRetestArmed   = array.new_bool()  // first retest pending (boost + optional cooldown bypass)
+var zoneBreakDirUp    = array.new_bool()  // for role-switch zones: true if breakout was up (new support), false if down (new resistance)
+
+// Episode arrays
+var epActiveArr   = array.new_bool()
+var epStepArr     = array.new_int()
+var epApproachIdA = array.new_int()
+var epLifeA       = array.new_int()
+
+var sRjA = array.new_float()
+var sAcA = array.new_float()
+var sCpA = array.new_float()
+var sSlA = array.new_float()
+var sSwA = array.new_float()
+
+var pRj0A = array.new_float()
+var pAc0A = array.new_float()
+var pCp0A = array.new_float()
+var pSl0A = array.new_float()
+var pSw0A = array.new_float()
+
+var PRjA = array.new_float()
+var PAcA = array.new_float()
+var PCpA = array.new_float()
+var PSlA = array.new_float()
+var PSwA = array.new_float()
+
+var lastDomA  = array.new_string()
+var lastConfA = array.new_float()
+var lastEntA  = array.new_float()
+var lastDoneBarA = array.new_int()
+var cooldownUntilA = array.new_int()
+
+f_delete_zone(idx) =>
+    bx = array.get(zonesBox, idx)
+    if not na(bx)
+        box.delete(bx)
+
+    array.remove(zonesLow, idx)
+    array.remove(zonesHigh, idx)
+    array.remove(zonesBorn, idx)
+    array.remove(zonesValid, idx)
+    array.remove(zonesTP, idx)
+    array.remove(zonesInInt, idx)
+    array.remove(zonesBox, idx)
+
+    array.remove(zoneRetired, idx)
+    array.remove(zoneRoleSwitched, idx)
+    array.remove(zoneRetestArmed, idx)
+    array.remove(zoneBreakDirUp, idx)
+
+    array.remove(epActiveArr, idx)
+    array.remove(epStepArr, idx)
+    array.remove(epApproachIdA, idx)
+    array.remove(epLifeA, idx)
+
+    array.remove(sRjA, idx)
+    array.remove(sAcA, idx)
+    array.remove(sCpA, idx)
+    array.remove(sSlA, idx)
+    array.remove(sSwA, idx)
+
+    array.remove(pRj0A, idx)
+    array.remove(pAc0A, idx)
+    array.remove(pCp0A, idx)
+    array.remove(pSl0A, idx)
+    array.remove(pSw0A, idx)
+
+    array.remove(PRjA, idx)
+    array.remove(PAcA, idx)
+    array.remove(PCpA, idx)
+    array.remove(PSlA, idx)
+    array.remove(PSwA, idx)
+
+    array.remove(lastDomA, idx)
+    array.remove(lastConfA, idx)
+    array.remove(lastEntA, idx)
+    array.remove(lastDoneBarA, idx)
+    array.remove(cooldownUntilA, idx)
+
+f_merge_into(i, j) =>
+    li = array.get(zonesLow, i)
+    hi = array.get(zonesHigh, i)
+    lj = array.get(zonesLow, j)
+    hj = array.get(zonesHigh, j)
+
+    array.set(zonesLow, j, math.min(li, lj))
+    array.set(zonesHigh, j, math.max(hi, hj))
+    array.set(zonesTP, j, array.get(zonesTP, j) + array.get(zonesTP, i))
+    array.set(zonesValid, j, array.get(zonesValid, j) or array.get(zonesValid, i))
+
+    array.set(zoneRetired, j, array.get(zoneRetired, j) or array.get(zoneRetired, i))
+    array.set(zoneRoleSwitched, j, array.get(zoneRoleSwitched, j) or array.get(zoneRoleSwitched, i))
+    array.set(zoneRetestArmed, j, array.get(zoneRetestArmed, j) or array.get(zoneRetestArmed, i))
+    array.set(zoneBreakDirUp, j, array.get(zoneBreakDirUp, j) or array.get(zoneBreakDirUp, i))
+
+    cuj = array.get(cooldownUntilA, j)
+    cui = array.get(cooldownUntilA, i)
+    array.set(cooldownUntilA, j, math.max(cuj, cui))
+
+    f_delete_zone(i)
+
+// add zone with metadata
+f_add_zone_meta(center, widthMult, isRoleSwitch, isBreakUp) =>
+    w = math.max(zoneWidthK * widthMult * atr, syminfo.mintick * 10)
+    zl = center - w
+    zh = center + w
+
+    array.push(zonesLow, zl)
+    array.push(zonesHigh, zh)
+    array.push(zonesBorn, bar_index)
+    array.push(zonesValid, isRoleSwitch ? roleSwitchValidate : false)
+    array.push(zonesTP, 0.0)
+    array.push(zonesInInt, false)
+    array.push(zonesBox, na)
+
+    array.push(zoneRetired, false)
+    array.push(zoneRoleSwitched, isRoleSwitch)
+    array.push(zoneRetestArmed, isRoleSwitch)  // first retest pending
+    array.push(zoneBreakDirUp, isBreakUp)
+
+    array.push(epActiveArr, false)
+    array.push(epStepArr, 0)
+    array.push(epApproachIdA, na)
+    array.push(epLifeA, na)
+
+    array.push(sRjA, 0.0)
+    array.push(sAcA, 0.0)
+    array.push(sCpA, 0.0)
+    array.push(sSlA, 0.0)
+    array.push(sSwA, 0.0)
+
+    array.push(pRj0A, 0.2)
+    array.push(pAc0A, 0.2)
+    array.push(pCp0A, 0.2)
+    array.push(pSl0A, 0.2)
+    array.push(pSw0A, 0.2)
+
+    array.push(PRjA, na)
+    array.push(PAcA, na)
+    array.push(PCpA, na)
+    array.push(PSlA, na)
+    array.push(PSwA, na)
+
+    array.push(lastDomA, "")
+    array.push(lastConfA, na)
+    array.push(lastEntA, na)
+    array.push(lastDoneBarA, na)
+    array.push(cooldownUntilA, na)
+
+// ============================================================
+// Zone creation via pivots
+// ============================================================
+ph = ta.pivothigh(high, pivotL, pivotR)
+pl = ta.pivotlow(low, pivotL, pivotR)
+if not na(ph)
+    f_add_zone_meta(ph, 1.0, false, false)
+if not na(pl)
+    f_add_zone_meta(pl, 1.0, false, false)
+
+// ============================================================
+// Merge pass
+// ============================================================
+if array.size(zonesLow) > 1
+    for pass = 0 to 1
+        i = 0
+        while i < array.size(zonesLow)
+            j = i + 1
+            while j < array.size(zonesLow)
+                li = array.get(zonesLow, i)
+                hi = array.get(zonesHigh, i)
+                lj = array.get(zonesLow, j)
+                hj = array.get(zonesHigh, j)
+                oi = f_overlapFrac(li, hi, lj, hj)
+                ci = (li + hi) * 0.5
+                cj = (lj + hj) * 0.5
+                centersClose = math.abs(ci - cj) <= (mergeCenterK * atr)
+                if oi >= mergeOverlap or centersClose
+                    f_merge_into(j, i)
+                else
+                    j += 1
+            i += 1
+
+// Cap zone count
+while array.size(zonesLow) > maxZones
+    oldestIdx = 0
+    oldestBorn = array.get(zonesBorn, 0)
+    for i = 1 to array.size(zonesBorn) - 1
+        b = array.get(zonesBorn, i)
+        if b < oldestBorn
+            oldestBorn := b
+            oldestIdx := i
+    f_delete_zone(oldestIdx)
+
+// TTL retirement
+if ttlBars > 0
+    i = 0
+    while i < array.size(zonesLow)
+        born = array.get(zonesBorn, i)
+        if bar_index - born > ttlBars
+            f_delete_zone(i)
+        else
+            i += 1
+
+// ============================================================
+// Update TP decay + draw zones
+// - retired: grey
+// - role-switch (armed): slightly distinct border
+// ============================================================
+for i = 0 to array.size(zonesLow) - 1
+    zl = array.get(zonesLow, i)
+    zh = array.get(zonesHigh, i)
+    valid = array.get(zonesValid, i)
+    retired = array.get(zoneRetired, i)
+    isRS = array.get(zoneRoleSwitched, i)
+    armed = array.get(zoneRetestArmed, i)
+
+    tp = array.get(zonesTP, i) * decayFactor
+    array.set(zonesTP, i, tp)
+
+    fatigue = f_clamp(tp / 6.0, 0.0, 1.0)
+    zoneState = fatigue < 0.30 ? 0 : fatigue < 0.65 ? 1 : 2
+
+    col = zoneState == 0 ? color.new(color.green, 85) :
+          zoneState == 1 ? color.new(color.orange, 85) :
+                           color.new(color.red, 85)
+
+    if retired and retireMark
+        col := color.new(color.gray, 88)
+
+    shouldShow = showZones and (not showOnlyValidated or valid)
+    bx = array.get(zonesBox, i)
+
+    if shouldShow and na(bx)
+        bx := box.new(left=bar_index, top=zh, right=bar_index+1, bottom=zl, border_width=1)
+        box.set_extend(bx, extend.right)
+        array.set(zonesBox, i, bx)
+
+    if shouldShow and not na(bx)
+        box.set_top(bx, zh)
+        box.set_bottom(bx, zl)
+        box.set_bgcolor(bx, col)
+        borderCol = armed and isRS and not retired ? color.new(color.yellow, 25) : color.new(color.gray, 60)
+        box.set_border_color(bx, borderCol)
+
+    if not shouldShow and not na(bx)
+        box.delete(bx)
+        array.set(zonesBox, i, na)
+
+// ============================================================
+// Active zone selection (skip retired)
+// ============================================================
+var activeIdx = array.new_int()
+array.clear(activeIdx)
+
+last = array.size(zonesLow)
+if last > 0
+    // Supports
+    for pick = 0 to keepSup - 1
+        bestI = na
+        bestD = 1e12
+        for i = 0 to last - 1
+            if array.get(zoneRetired, i)
+                continue
+            if selectOnlyValidated and not array.get(zonesValid, i)
+                continue
+
+            zl = array.get(zonesLow, i)
+            zh = array.get(zonesHigh, i)
+
+            already = false
+            for k = 0 to array.size(activeIdx) - 1
+                if array.get(activeIdx, k) == i
+                    already := true
+            if already
+                continue
+
+            isSup = (zh <= close) or (close >= zl and close <= zh)
+            if isSup
+                d = (close >= zl and close <= zh) ? 0.0 : (close - zh)
+                if d < bestD
+                    bestD := d
+                    bestI := i
+        if not na(bestI)
+            array.push(activeIdx, bestI)
+
+    // Resistances
+    for pick = 0 to keepRes - 1
+        bestI = na
+        bestD = 1e12
+        for i = 0 to last - 1
+            if array.get(zoneRetired, i)
+                continue
+            if selectOnlyValidated and not array.get(zonesValid, i)
+                continue
+
+            zl = array.get(zonesLow, i)
+            zh = array.get(zonesHigh, i)
+
+            already = false
+            for k = 0 to array.size(activeIdx) - 1
+                if array.get(activeIdx, k) == i
+                    already := true
+            if already
+                continue
+
+            isRes = (zl >= close) or (close >= zl and close <= zh)
+            if isRes
+                d = (close >= zl and close <= zh) ? 0.0 : (zl - close)
+                if d < bestD
+                    bestD := d
+                    bestI := i
+        if not na(bestI)
+            array.push(activeIdx, bestI)
+
+// ============================================================
+// Touch tracking per selected zone
+// (also: arm consumption for role-switch zones happens on first touch)
+// ============================================================
+for k = 0 to array.size(activeIdx) - 1
+    i = array.get(activeIdx, k)
+    zl = array.get(zonesLow, i)
+    zh = array.get(zonesHigh, i)
+
+    touchZone = (high >= zl and low <= zh)
+    inInteraction = array.get(zonesInInt, i)
+    exited = (close > zh + exitEps) or (close < zl - exitEps)
+
+    newTouch = (not inInteraction) and touchZone
+    if newTouch
+        inZoneClose = (close >= zl and close <= zh)
+        sliceAttempt = (close > zh + eps) or (close < zl - eps)
+        touchW = inZoneClose ? 1.0 : 0.7
+        touchW += sliceAttempt ? 0.6 : 0.0
+
+        array.set(zonesTP, i, array.get(zonesTP, i) + touchW)
+        array.set(zonesInInt, i, true)
+
+    if inInteraction and exited
+        array.set(zonesInInt, i, false)
+
+// ============================================================
+// Episodes: concurrency + cooldown + retirement + ROLE-SWITCH CREATION
+// ============================================================
+anyReject = false
+anyAccept = false
+anyCompress = false
+anySlice = false
+anySweep = false
+var int lastCompletedIdx = na
+
+for k = 0 to array.size(activeIdx) - 1
+    i = array.get(activeIdx, k)
+    zl = array.get(zonesLow, i)
+    zh = array.get(zonesHigh, i)
+
+    touch = (high >= zl and low <= zh)
+    epActive = array.get(epActiveArr, i)
+
+    cu = array.get(cooldownUntilA, i)
+    inCooldown = useCooldown and not na(cu) and bar_index < cu
+
+    isRS = array.get(zoneRoleSwitched, i)
+    armed = array.get(zoneRetestArmed, i)
+    bypassCd = bypassCooldownOnRetest and isRS and armed
+
+    // START (cooldown respected unless bypass)
+    if touch and not epActive and (not inCooldown or bypassCd)
+        array.set(epActiveArr, i, true)
+        array.set(epStepArr, i, 0)
+        array.set(sRjA, i, 0.0)
+        array.set(sAcA, i, 0.0)
+        array.set(sCpA, i, 0.0)
+        array.set(sSlA, i, 0.0)
+        array.set(sSwA, i, 0.0)
+
+        // Approach priors
+        aId = f_approachId(zl, zh)
+        array.set(epApproachIdA, i, aId)
+
+        pr = f_priors(aId)
+        pRj = array.get(pr,0)
+        pAc = array.get(pr,1)
+        pCp = array.get(pr,2)
+        pSl = array.get(pr,3)
+        pSw = array.get(pr,4)
+
+        // BB nudges
+        if (bbTouchLower or bbTouchUpper)
+            pRj += 0.08
+            pSw += 0.06
+            pAc -= 0.06
+        if (bbWalkUp or bbWalkDn)
+            pSl += 0.10
+            pRj -= 0.08
+        if bbSqueeze
+            pCp += 0.10
+            pSw -= 0.05
+
+        // Lifecycle nudges
+        tp = array.get(zonesTP, i)
+        fatigue = f_clamp(tp / 6.0, 0.0, 1.0)
+        life = fatigue < 0.30 ? 0 : fatigue < 0.65 ? 1 : 2
+        array.set(epLifeA, i, life)
+
+        if life == 0
+            pRj += 0.10
+            pSw += 0.06
+            pSl -= 0.10
+        if life == 1
+            pCp += 0.08
+            pSl += 0.10
+            pRj -= 0.08
+        if life == 2
+            pSl += 0.18
+            pCp += 0.08
+            pRj -= 0.18
+            pSw -= 0.06
+
+        // ROLE-SWITCH first-retest bias (only once)
+        if roleSwitchFirstTouchBoost and isRS and armed
+            pAc += boostAc
+            pCp += boostCp
+            pSl = math.max(0.0, pSl - penalizeSl)
+            // consume arm immediately at episode start (so only first retest is special)
+            array.set(zoneRetestArmed, i, false)
+
+        pr2 = f_renorm(pRj, pAc, pCp, pSl, pSw)
+        array.set(pRj0A, i, array.get(pr2,0))
+        array.set(pAc0A, i, array.get(pr2,1))
+        array.set(pCp0A, i, array.get(pr2,2))
+        array.set(pSl0A, i, array.get(pr2,3))
+        array.set(pSw0A, i, array.get(pr2,4))
+
+    // UPDATE
+    if array.get(epActiveArr, i)
+        step = array.get(epStepArr, i) + 1
+        array.set(epStepArr, i, step)
+
+        inZone = (close >= zl and close <= zh)
+        pierceUp  = high > zh + eps
+        pierceDn  = low  < zl - eps
+        closeAbove = close > zh + eps
+        closeBelow = close < zl - eps
+
+        wickUpN = (high - math.max(open, close)) / math.max(atr, syminfo.mintick)
+        wickDnN = (math.min(open, close) - low) / math.max(atr, syminfo.mintick)
+        dispAwayN = math.max(math.abs(close - zh), math.abs(close - zl)) / math.max(atr, syminfo.mintick)
+        rangeN = (high - low) / math.max(atr, syminfo.mintick)
+
+        sRj = array.get(sRjA, i)
+        sAc = array.get(sAcA, i)
+        sCp = array.get(sCpA, i)
+        sSl = array.get(sSlA, i)
+        sSw = array.get(sSwA, i)
+
+        // Evidence deltas
+        if (pierceUp and close <= zh) or (pierceDn and close >= zl)
+            sSw += 0.8
+        sSw += 0.4 * math.max(wickUpN, wickDnN)
+
+        if closeAbove or closeBelow
+            sSl += 0.6
+        if holdBars >= 2
+            if (closeAbove and closeAbove[1]) or (closeBelow and closeBelow[1])
+                sSl += 0.4
+        sSl += 0.3 * dispAwayN
+
+        if inZone
+            sAc += 0.35
+
+        if not inZone and (dispAwayN * atr) > dispThr
+            sRj += 0.45
+        sRj += 0.15 * ((pierceUp ? wickUpN : 0.0) + (pierceDn ? wickDnN : 0.0))
+
+        if inZone and (rangeN < rangeN[1])
+            sCp += 0.35
+
+        array.set(sRjA, i, sRj)
+        array.set(sAcA, i, sAc)
+        array.set(sCpA, i, sCp)
+        array.set(sSlA, i, sSl)
+        array.set(sSwA, i, sSw)
+
+        pRj0 = array.get(pRj0A, i)
+        pAc0 = array.get(pAc0A, i)
+        pCp0 = array.get(pCp0A, i)
+        pSl0 = array.get(pSl0A, i)
+        pSw0 = array.get(pSw0A, i)
+
+        lRj = math.log(math.max(pRj0, 1e-9)) + sRj
+        lAc = math.log(math.max(pAc0, 1e-9)) + sAc
+        lCp = math.log(math.max(pCp0, 1e-9)) + sCp
+        lSl = math.log(math.max(pSl0, 1e-9)) + sSl
+        lSw = math.log(math.max(pSw0, 1e-9)) + sSw
+
+        eRj = math.exp(lRj)
+        eAc = math.exp(lAc)
+        eCp = math.exp(lCp)
+        eSl = math.exp(lSl)
+        eSw = math.exp(lSw)
+        denom = eRj + eAc + eCp + eSl + eSw
+
+        PRj = eRj / denom
+        PAc = eAc / denom
+        PCp = eCp / denom
+        PSl = eSl / denom
+        PSw = eSw / denom
+
+        array.set(PRjA, i, PRj)
+        array.set(PAcA, i, PAc)
+        array.set(PCpA, i, PCp)
+        array.set(PSlA, i, PSl)
+        array.set(PSwA, i, PSw)
+
+        // entropy
+        ent = 0.0
+        ent += PRj > 0 ? -PRj * math.log(PRj) : 0
+        ent += PAc > 0 ? -PAc * math.log(PAc) : 0
+        ent += PCp > 0 ? -PCp * math.log(PCp) : 0
+        ent += PSl > 0 ? -PSl * math.log(PSl) : 0
+        ent += PSw > 0 ? -PSw * math.log(PSw) : 0
+        array.set(lastEntA, i, ent)
+
+        // COMPLETE
+        if step >= lookReact
+            topP = math.max(PRj, math.max(PAc, math.max(PCp, math.max(PSl, PSw))))
+            dom = topP == PRj ? "REJECT" :
+                  topP == PAc ? "ACCEPT" :
+                  topP == PCp ? "COMPRESS" :
+                  topP == PSl ? "SLICE" : "SWEEP"
+
+            array.set(lastDomA, i, dom)
+            array.set(lastConfA, i, topP)
+            array.set(lastDoneBarA, i, bar_index)
+            lastCompletedIdx := i
+
+            if showLabels
+                label.new(bar_index, high, dom + "  " + str.tostring(topP*100, "#.0") + "%", style=label.style_label_down, textcolor=color.white, color=color.new(color.black, 60))
+
+            // validate
+            if (dom == "REJECT" or dom == "SWEEP") and topP >= 0.55
+                array.set(zonesValid, i, true)
+
+            // cooldown
+            if useCooldown and cooldownBars > 0
+                array.set(cooldownUntilA, i, bar_index + cooldownBars)
+
+            // retirement rule: strong SLICE + hold
+            retiredNow = false
+            brokeUp = false
+            brokeDn = false
+            if autoRetire
+                holdOK = true
+                for hb = 0 to retireHoldBars - 1
+                    holdOK := holdOK and ((close[hb] > zh + eps) or (close[hb] < zl - eps))
+                retiredNow := (dom == "SLICE") and (topP >= retireConf) and holdOK
+                if retiredNow
+                    array.set(zoneRetired, i, true)
+                    brokeUp := close > zh + eps
+                    brokeDn := close < zl - eps
+
+            // ROLE SWITCH: create new zone on the breakout boundary
+            if enableRoleSwitch and retiredNow and enableRoleSwitch
+                // breakout above -> new SUPPORT centered at zh
+                // breakout below -> new RESISTANCE centered at zl
+                if brokeUp
+                    f_add_zone_meta(zh, roleSwitchWidthMult, true, true)
+                else if brokeDn
+                    f_add_zone_meta(zl, roleSwitchWidthMult, true, false)
+
+            // alerts
+            if topP >= minConf
+                anyReject   := anyReject   or (dom == "REJECT")
+                anyAccept   := anyAccept   or (dom == "ACCEPT")
+                anyCompress := anyCompress or (dom == "COMPRESS")
+                anySlice    := anySlice    or (dom == "SLICE")
+                anySweep    := anySweep    or (dom == "SWEEP")
+
+            // stop episode
+            array.set(epActiveArr, i, false)
+            array.set(epStepArr, i, 0)
+
+// ============================================================
+// Alerts (any zone)
+// ============================================================
+alertcondition(anyReject,   "Reaction: REJECT (any zone)",   "REJECT with confidence >= threshold")
+alertcondition(anyAccept,   "Reaction: ACCEPT (any zone)",   "ACCEPT with confidence >= threshold")
+alertcondition(anyCompress, "Reaction: COMPRESS (any zone)", "COMPRESS with confidence >= threshold")
+alertcondition(anySlice,    "Reaction: SLICE (any zone)",    "SLICE with confidence >= threshold")
+alertcondition(anySweep,    "Reaction: SWEEP (any zone)",    "SWEEP with confidence >= threshold")
+
+// ============================================================
+// Panel: Top-1 / Top-3 live episodes by confidence (else last completed)
+// ============================================================
+var table t = na
+if showPanel and na(t)
+    t := table.new(f_panelPos(panelPos), 4, 9, border_width=1)
+if not showPanel and not na(t)
+    table.delete(t)
+    t := na
+
+var rankIdx = array.new_int()
+var rankP   = array.new_float()
+array.clear(rankIdx)
+array.clear(rankP)
+
+for k = 0 to array.size(activeIdx) - 1
+    i = array.get(activeIdx, k)
+    if array.get(epActiveArr, i)
+        PRj = array.get(PRjA, i)
+        PAc = array.get(PAcA, i)
+        PCp = array.get(PCpA, i)
+        PSl = array.get(PSlA, i)
+        PSw = array.get(PSwA, i)
+        topP = math.max(PRj, math.max(PAc, math.max(PCp, math.max(PSl, PSw))))
+        array.push(rankIdx, i)
+        array.push(rankP, topP)
+
+for a = 0 to array.size(rankIdx) - 2
+    for b = a + 1 to array.size(rankIdx) - 1
+        if array.get(rankP, b) > array.get(rankP, a)
+            tmpI = array.get(rankIdx, a)
+            tmpP = array.get(rankP, a)
+            array.set(rankIdx, a, array.get(rankIdx, b))
+            array.set(rankP, a, array.get(rankP, b))
+            array.set(rankIdx, b, tmpI)
+            array.set(rankP, b, tmpP)
+
+rowsWanted = panelMode == "Top 3" ? 3 : 1
+
+if showPanel and not na(t)
+    table.cell(t, 0, 0, "Rank", text_color=color.white, bgcolor=color.new(color.black, 30))
+    table.cell(t, 1, 0, "Zone", text_color=color.white, bgcolor=color.new(color.black, 30))
+    table.cell(t, 2, 0, "Approach/Life", text_color=color.white, bgcolor=color.new(color.black, 30))
+    table.cell(t, 3, 0, "Top / Posterior", text_color=color.white, bgcolor=color.new(color.black, 30))
+
+    for r = 1 to rowsWanted
+        if r-1 < array.size(rankIdx)
+            i = array.get(rankIdx, r-1)
+            zl = array.get(zonesLow, i)
+            zh = array.get(zonesHigh, i)
+
+            aId = array.get(epApproachIdA, i)
+            life = array.get(epLifeA, i)
+
+            valid = array.get(zonesValid, i)
+            retired = array.get(zoneRetired, i)
+            isRS = array.get(zoneRoleSwitched, i)
+            armed = array.get(zoneRetestArmed, i)
+
+            PRj = array.get(PRjA, i)
+            PAc = array.get(PAcA, i)
+            PCp = array.get(PCpA, i)
+            PSl = array.get(PSlA, i)
+            PSw = array.get(PSwA, i)
+            topP = array.get(rankP, r-1)
+            dom = topP == PRj ? "Rj" : topP == PAc ? "Ac" : topP == PCp ? "Cp" : topP == PSl ? "Sl" : "Sw"
+
+            zName = (close >= zl and close <= zh ? "IN" : close > zh ? "SUP" : "RES")
+            flags = (valid ? "V" : "-") + (retired ? "X" : "-") + (isRS ? "R" : "-") + (armed ? "!" : "-")
+
+            table.cell(t, 0, r, "#" + str.tostring(r), bgcolor=color.new(color.black, 88))
+            table.cell(t, 1, r, zName + " [" + flags + "]", bgcolor=color.new(color.black, 88))
+            table.cell(t, 2, r, f_approachName(aId) + " / " + f_lifecycleName(life), bgcolor=color.new(color.black, 88))
+            table.cell(t, 3, r, dom + " " + f_pct(topP) + " | " + f_pct(PRj)+"/"+f_pct(PAc)+"/"+f_pct(PCp)+"/"+f_pct(PSl)+"/"+f_pct(PSw), bgcolor=color.new(color.black, 88))
+        else
+            table.cell(t, 0, r, "", bgcolor=color.new(color.black, 92))
+            table.cell(t, 1, r, "", bgcolor=color.new(color.black, 92))
+            table.cell(t, 2, r, "", bgcolor=color.new(color.black, 92))
+            table.cell(t, 3, r, "", bgcolor=color.new(color.black, 92))
+
+    if array.size(rankIdx) == 0 and not na(lastCompletedIdx)
+        i = lastCompletedIdx
+        dom = array.get(lastDomA, i)
+        conf = array.get(lastConfA, i)
+        aId = array.get(epApproachIdA, i)
+        life = array.get(epLifeA, i)
+        valid = array.get(zonesValid, i)
+        retired = array.get(zoneRetired, i)
+        isRS = array.get(zoneRoleSwitched, i)
+        armed = array.get(zoneRetestArmed, i)
+        flags = (valid ? "V" : "-") + (retired ? "X" : "-") + (isRS ? "R" : "-") + (armed ? "!" : "-")
+        table.cell(t, 0, 1, "LAST", bgcolor=color.new(color.black, 88))
+        table.cell(t, 1, 1, "[" + flags + "]", bgcolor=color.new(color.black, 88))
+        table.cell(t, 2, 1, f_approachName(aId) + " / " + f_lifecycleName(life), bgcolor=color.new(color.black, 88))
+        table.cell(t, 3, 1, dom + " " + (not na(conf) ? f_pct(conf) : "-"), bgcolor=color.new(color.black, 88))
